@@ -111,6 +111,8 @@ export interface MCPServerConfig {
   connectionPool?: ConnectionPoolConfig;
   corsEnabled?: boolean;
   corsOrigins?: string[];
+  /** Extra Host header names accepted on a loopback bind (DNS-rebinding guard). */
+  allowedHosts?: string[];
   maxRequestSize?: number;
   requestTimeout?: number;
   enableMetrics?: boolean;

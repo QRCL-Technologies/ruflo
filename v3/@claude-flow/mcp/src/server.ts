@@ -226,6 +226,8 @@ export class MCPServer extends EventEmitter implements IMCPServer {
         port: this.config.port,
         corsEnabled: this.config.corsEnabled,
         corsOrigins: this.config.corsOrigins,
+        allowedOrigins: this.config.corsOrigins,
+        allowedHosts: this.config.allowedHosts,
         auth: this.config.auth,
         maxRequestSize: String(this.config.maxRequestSize),
         requestTimeout: this.config.requestTimeout,
