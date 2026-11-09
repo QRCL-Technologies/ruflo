@@ -2,7 +2,8 @@
 /**
  * #4226 — with MCP_AUTH_TOKEN unset (local-only mode) the bridge must not
  * serve requests a browser sends for a foreign web page, even on loopback.
- * Spawns the bridge and checks over the wire:
+ * Spawns each bridge (this one and the ruvocal variant shipped in
+ * docker-compose) and checks over the wire:
  *   G1. a native client (no Origin, loopback Host) still reaches POST /mcp
  *   G2. POST /mcp with a foreign Origin → 403 (simple request, no preflight)
  *   G3. OPTIONS preflight from a foreign Origin → 403, no ACAO: *
@@ -19,7 +20,11 @@ import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
-const ENTRY = path.join(path.dirname(fileURLToPath(import.meta.url)), "index.js");
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const BRIDGES = [
+  path.join(HERE, "index.js"),
+  path.join(HERE, "..", "ruvocal", "mcp-bridge", "index.js"),
+];
 const QUIET = {
   MCP_GROUP_INTELLIGENCE: "false",
   MCP_GROUP_AGENTS: "false",
@@ -33,9 +38,9 @@ function check(cond, label) {
   if (!cond) failed++;
 }
 
-async function withBridge(env, fn) {
+async function withBridge(entry, env, fn) {
   const port = 20000 + Math.floor(Math.random() * 10000);
-  const child = spawn("node", [ENTRY], { env: { ...process.env, ...QUIET, PORT: String(port), ...env }, stdio: "ignore" });
+  const child = spawn("node", [entry], { env: { ...process.env, ...QUIET, PORT: String(port), ...env }, stdio: "ignore" });
   try {
     for (let i = 0; i < 50; i++) {
       const up = await request(port, { method: "GET", path: "/health" }).then(r => r.status > 0, () => false);
@@ -64,24 +69,27 @@ function request(port, { method = "POST", path: p = "/mcp", headers = {}, body }
 const initialize = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
 const json = { "Content-Type": "application/json" };
 
-console.log("local-only mode (no MCP_AUTH_TOKEN)");
-await withBridge({ MCP_CORS_ORIGIN: "" }, async (port) => {
-  check((await request(port, { headers: json, body: initialize })).status === 200, "G1 native client reaches /mcp");
-  check((await request(port, { headers: { ...json, Origin: "https://example.com" }, body: initialize })).status === 403, "G2 foreign Origin POST → 403");
-  const pre = await request(port, { method: "OPTIONS", headers: { Origin: "https://example.com", "Access-Control-Request-Method": "POST" } });
-  check(pre.status === 403 && pre.headers["access-control-allow-origin"] === undefined, "G3 foreign preflight → 403 without ACAO");
-  check((await request(port, { headers: { ...json, Host: "evil.example" }, body: initialize })).status === 403, "G4 non-loopback Host → 403");
-  check((await request(port, { headers: { ...json, Origin: "http://localhost:5173" }, body: initialize })).status === 200, "G5 loopback Origin accepted");
-});
-await withBridge({ MCP_CORS_ORIGIN: "https://ui.example" }, async (port) => {
-  check((await request(port, { headers: { ...json, Origin: "https://ui.example" }, body: initialize })).status === 200, "G6 allowlisted Origin accepted");
-});
+for (const entry of BRIDGES) {
+  console.log(`\n# ${path.relative(path.join(HERE, "..", ".."), entry)}`);
+  console.log("local-only mode (no MCP_AUTH_TOKEN)");
+  await withBridge(entry, { MCP_CORS_ORIGIN: "" }, async (port) => {
+    check((await request(port, { headers: json, body: initialize })).status === 200, "G1 native client reaches /mcp");
+    check((await request(port, { headers: { ...json, Origin: "https://example.com" }, body: initialize })).status === 403, "G2 foreign Origin POST → 403");
+    const pre = await request(port, { method: "OPTIONS", headers: { Origin: "https://example.com", "Access-Control-Request-Method": "POST" } });
+    check(pre.status === 403 && pre.headers["access-control-allow-origin"] === undefined, "G3 foreign preflight → 403 without ACAO");
+    check((await request(port, { headers: { ...json, Host: "evil.example" }, body: initialize })).status === 403, "G4 non-loopback Host → 403");
+    check((await request(port, { headers: { ...json, Origin: "http://localhost:5173" }, body: initialize })).status === 200, "G5 loopback Origin accepted");
+  });
+  await withBridge(entry, { MCP_CORS_ORIGIN: "https://ui.example" }, async (port) => {
+    check((await request(port, { headers: { ...json, Origin: "https://ui.example" }, body: initialize })).status === 200, "G6 allowlisted Origin accepted");
+  });
 
-console.log("token mode");
-await withBridge({ MCP_AUTH_TOKEN: "t0ken" }, async (port) => {
-  const res = await request(port, { headers: { ...json, Origin: "https://example.com", Authorization: "Bearer t0ken" }, body: initialize });
-  check(res.status === 200, "G7 bearer token decides when set");
-});
+  console.log("token mode");
+  await withBridge(entry, { MCP_AUTH_TOKEN: "t0ken" }, async (port) => {
+    const res = await request(port, { headers: { ...json, Origin: "https://example.com", Authorization: "Bearer t0ken" }, body: initialize });
+    check(res.status === 200, "G7 bearer token decides when set");
+  });
+}
 
 console.log(failed ? `\n${failed} check(s) failed` : "\nall checks passed");
 process.exit(failed ? 1 : 0);

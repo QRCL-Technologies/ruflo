@@ -12,6 +12,7 @@
  *   5. `executeTool` denies terminal_execute unless `MCP_ENABLE_TERMINAL === "true"` (Phase 1d + 2a)
  *   6. CORS respects `MCP_CORS_ORIGIN` allowlist (Phase 3b)
  *   9. Both production images use the supported Node 24 LTS line (#2847)
+ *  10. Local-only browser guard is mounted (Host/Origin check, #4226)
  *
  * Runs offline (no server, no deps). CI-safe.
  *
@@ -72,6 +73,11 @@ const CHECKS = [
     id: "8. mcp-session-id-header (#2425)",
     rx: /Mcp-Session-Id/,
     hint: "Mcp-Session-Id header must be echoed on /mcp* responses (#2425)",
+  },
+  {
+    id: "10. local-browser-guard-mounted (#4226)",
+    rx: /app\.use\(\s*\(req,\s*res,\s*next\)\s*=>\s*localBrowserGuard\(req,\s*res,\s*next\)\s*\)[\s\S]*?function localBrowserGuard[\s\S]*?forbidden host[\s\S]*?forbidden origin/,
+    hint: "localBrowserGuard (Host + Origin check when MCP_AUTH_TOKEN is unset) must be mounted before routes (#4226)",
   },
 ];
 
