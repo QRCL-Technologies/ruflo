@@ -3,10 +3,11 @@
  *
  * Fetches the verification.md.json witness manifest from the live repo,
  * recomputes SHA-256 of every cited file in the user's installed
- * artifact, re-derives the Ed25519 public key from the manifest's git
- * commit, and verifies the signature.
+ * artifact, and verifies the Ed25519 signature against a pinned
+ * publisher public key (never the key carried inside the manifest).
  *
  * Run via: ruflo verify [--branch <branch>] [--manifest <local-path>]
+ *          [--public-key <hex>]
  *
  * If everything checks, the user has byte-for-byte the same fix
  * footprint as the manifest claims. If anything mismatches, the
@@ -46,10 +47,36 @@ interface Witness {
     manifestHashAlgo: string;
     manifestHash: string;
     signatureAlgo: string;
-    publicKey: string;
+    /** Informational only — never trusted for verification. */
+    publicKey?: string;
     signature: string;
-    seedDerivation: string;
+    seedDerivation?: string;
   };
+}
+
+/**
+ * Trust anchors: hex-encoded Ed25519 public keys of the ruflo release
+ * signing key(s). The matching private key must be kept secret (CI secret
+ * or KMS). Never derive a signing key from public manifest data.
+ */
+export const TRUSTED_WITNESS_PUBLIC_KEYS: readonly string[] = [];
+
+export const WITNESS_PUBLIC_KEY_ENV = 'RUFLO_WITNESS_PUBLIC_KEY';
+
+const ED25519_PUBLIC_KEY_HEX = /^[0-9a-f]{64}$/;
+
+export function resolveTrustedPublicKeys(cliKey?: string): string[] {
+  const sources = cliKey ? [cliKey] : [process.env[WITNESS_PUBLIC_KEY_ENV] ?? '', ...TRUSTED_WITNESS_PUBLIC_KEYS];
+  const keys = sources
+    .flatMap((k) => k.split(','))
+    .map((k) => k.trim().toLowerCase())
+    .filter((k) => k.length > 0);
+  for (const k of keys) {
+    if (!ED25519_PUBLIC_KEY_HEX.test(k)) {
+      throw new Error(`Invalid Ed25519 public key (expected 64 hex chars): ${k}`);
+    }
+  }
+  return [...new Set(keys)];
 }
 
 const DEFAULT_MANIFEST_URL = 'https://raw.githubusercontent.com/ruvnet/ruflo/{branch}/verification.md.json';
@@ -136,17 +163,26 @@ function fileContains(path: string, marker: string): boolean {
   return readFileSync(path, 'utf-8').includes(marker);
 }
 
-async function verifySignature(witness: Witness): Promise<{
+export interface SignatureResult {
   manifestHashOk: boolean;
-  publicKeyReproducible: boolean;
+  trustedKeyConfigured: boolean;
   signatureValid: boolean;
-}> {
+  signedBy: string | null;
+}
+
+export async function verifySignature(witness: Witness, trustedKeys: readonly string[]): Promise<SignatureResult> {
+  const result: SignatureResult = {
+    manifestHashOk: false,
+    trustedKeyConfigured: trustedKeys.length > 0,
+    signatureValid: false,
+    signedBy: null,
+  };
   // Lazy-load @noble/ed25519 — keep verify command snappy when no signature check needed
   let ed: typeof import('@noble/ed25519') | null = null;
   try {
     ed = await import('@noble/ed25519');
   } catch {
-    return { manifestHashOk: false, publicKeyReproducible: false, signatureValid: false };
+    return result;
   }
   // Configure sync sha512 for the v2 API
   const sha512Sync = (...m: Uint8Array[]): Uint8Array => {
@@ -158,19 +194,31 @@ async function verifySignature(witness: Witness): Promise<{
 
   const manifestCanonical = JSON.stringify(witness.manifest);
   const recomputedHash = createHash('sha256').update(manifestCanonical).digest('hex');
-  const manifestHashOk = recomputedHash === witness.integrity.manifestHash;
+  result.manifestHashOk = recomputedHash === witness.integrity?.manifestHash;
 
-  const seed = createHash('sha256').update(witness.manifest.gitCommit + ':ruflo-witness/v1').digest();
-  const reKey = ed.getPublicKey(seed);
-  const publicKeyReproducible = Buffer.from(reKey).toString('hex') === witness.integrity.publicKey;
+  const signatureHex = witness.integrity?.signature;
+  if (typeof signatureHex !== 'string' || !/^[0-9a-fA-F]{128}$/.test(signatureHex)) {
+    return result;
+  }
+  const signature = Buffer.from(signatureHex, 'hex');
+  const message = Buffer.from(recomputedHash, 'hex');
 
-  const signatureValid = ed.verify(
-    Buffer.from(witness.integrity.signature, 'hex'),
-    Buffer.from(witness.integrity.manifestHash, 'hex'),
-    Buffer.from(witness.integrity.publicKey, 'hex'),
-  );
-
-  return { manifestHashOk, publicKeyReproducible, signatureValid };
+  // Only keys pinned by the publisher are trusted; integrity.publicKey from
+  // the manifest is attacker-controlled and deliberately ignored.
+  for (const key of trustedKeys) {
+    let ok = false;
+    try {
+      ok = ed.verify(signature, message, Buffer.from(key, 'hex'));
+    } catch {
+      ok = false;
+    }
+    if (ok) {
+      result.signatureValid = true;
+      result.signedBy = key;
+      break;
+    }
+  }
+  return result;
 }
 
 export const verifyCommand: Command = {
@@ -191,6 +239,11 @@ export const verifyCommand: Command = {
       description: 'Local path to a verification.md.json file (overrides --branch)',
     },
     {
+      name: 'public-key',
+      type: 'string',
+      description: `Trusted publisher Ed25519 public key (hex, comma-separated). Defaults to $${WITNESS_PUBLIC_KEY_ENV} or the keys pinned in the CLI`,
+    },
+    {
       name: 'json',
       type: 'boolean',
       description: 'Output JSON instead of human-readable table',
@@ -207,6 +260,7 @@ export const verifyCommand: Command = {
     const branch = (ctx.flags.branch as string) || 'fix/issues-may-1-3';
     const localPath = ctx.flags.manifest as string | undefined;
     const asJson = ctx.flags.json === true;
+    const cliPublicKey = (ctx.flags['public-key'] ?? ctx.flags.publicKey) as string | undefined;
 
     if (!asJson) {
       output.writeln();
@@ -224,8 +278,18 @@ export const verifyCommand: Command = {
       return { success: false, exitCode: 1 };
     }
 
+    let trustedKeys: string[];
+    try {
+      trustedKeys = resolveTrustedPublicKeys(cliPublicKey);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (asJson) output.printJson({ ok: false, error: msg });
+      else output.printError(msg);
+      return { success: false, exitCode: 1 };
+    }
+
     // Signature verification
-    const sig = await verifySignature(witness);
+    const sig = await verifySignature(witness, trustedKeys);
 
     // File verification
     const fileResults = witness.manifest.fixes.map((fix) => {
@@ -247,7 +311,7 @@ export const verifyCommand: Command = {
     const regressedCount = fileResults.filter((r) => r.status === 'regressed').length;
     const missingCount = fileResults.filter((r) => r.status === 'missing').length;
 
-    const allOk = sig.manifestHashOk && sig.publicKeyReproducible && sig.signatureValid && regressedCount === 0;
+    const allOk = sig.manifestHashOk && sig.signatureValid && regressedCount === 0;
 
     if (asJson) {
       output.printJson({
@@ -263,8 +327,8 @@ export const verifyCommand: Command = {
     output.writeln();
     output.writeln(output.bold('Manifest signature'));
     output.writeln(`  manifest hash matches: ${sig.manifestHashOk ? output.success('yes') : output.error('no')}`);
-    output.writeln(`  public key reproducible from gitCommit: ${sig.publicKeyReproducible ? output.success('yes') : output.error('no')}`);
-    output.writeln(`  Ed25519 signature valid: ${sig.signatureValid ? output.success('yes') : output.error('no')}`);
+    output.writeln(`  trusted publisher key configured: ${sig.trustedKeyConfigured ? output.success('yes') : output.error('no')}`);
+    output.writeln(`  Ed25519 signature valid (trusted key): ${sig.signatureValid ? output.success('yes') : output.error('no')}`);
     output.writeln();
 
     output.writeln(output.bold('Fix verification'));
@@ -303,7 +367,9 @@ export const verifyCommand: Command = {
     if (driftCount > 0) {
       output.printWarning(`${driftCount} fix(es) drifted. Markers present, but file SHA-256 differs (could be a benign edit; inspect the diff).`);
     }
-    if (!sig.signatureValid || !sig.manifestHashOk) {
+    if (!sig.trustedKeyConfigured) {
+      output.printError(`No trusted publisher public key configured. Pass --public-key or set ${WITNESS_PUBLIC_KEY_ENV}.`);
+    } else if (!sig.signatureValid || !sig.manifestHashOk) {
       output.printError('Manifest signature failed verification. The witness file may have been tampered with or corrupted.');
     }
     return { success: false, exitCode: 1 };
