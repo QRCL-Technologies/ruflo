@@ -91,12 +91,12 @@ const startCommand: Command = {
     },
     {
       name: 'auth-token-file',
-      description: 'Read the HTTP bearer token from this file (http transport). Preferred over --auth-token; env RUFLO_MCP_HTTP_TOKEN also works',
+      description: 'Read the bearer token from this file (http and websocket transports). Preferred over --auth-token; env RUFLO_MCP_HTTP_TOKEN also works',
       type: 'string'
     },
     {
       name: 'auth-token',
-      description: 'HTTP bearer token (16+ printable ASCII chars). Visible in argv/ps - prefer RUFLO_MCP_HTTP_TOKEN or --auth-token-file',
+      description: 'Bearer token for http/websocket transports (16+ printable ASCII chars). Visible in argv/ps - prefer RUFLO_MCP_HTTP_TOKEN or --auth-token-file',
       type: 'string'
     },
     {
@@ -279,6 +279,14 @@ const startCommand: Command = {
         }
       } else if (transport === 'websocket') {
         output.writeln(output.dim(`  WebSocket: ws://${host}:${port}/ws`));
+        output.writeln(output.dim('  Browser origins are rejected (cross-site WebSocket protection)'));
+        if (authToken) {
+          output.writeln(output.dim('  Auth: bearer token required on the upgrade request (Authorization: Bearer <token>)'));
+        } else if (isLoopbackHost(host)) {
+          output.printWarning('No auth token set: any local process can call tools. Set RUFLO_MCP_HTTP_TOKEN to require a bearer token.');
+        } else {
+          output.printWarning('Running UNAUTHENTICATED on a non-loopback host (RUFLO_MCP_ALLOW_UNAUTHENTICATED_HTTP is set).');
+        }
       }
 
       if (daemon) {
