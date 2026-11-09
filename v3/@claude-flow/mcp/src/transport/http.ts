@@ -24,6 +24,7 @@ import type {
   ILogger,
   AuthConfig,
 } from '../types.js';
+import { isAllowedHostHeader, isAllowedOrigin, rejectUpgradeReason } from './origin-guard.js';
 
 export interface HttpTransportConfig {
   host: string;
@@ -33,6 +34,8 @@ export interface HttpTransportConfig {
   tlsKey?: string;
   corsEnabled?: boolean;
   corsOrigins?: string[];
+  /** Extra Host header names accepted on a loopback bind (DNS-rebinding guard). */
+  allowedHosts?: string[];
   auth?: AuthConfig;
   maxRequestSize?: string;
   requestTimeout?: number;
@@ -85,6 +88,22 @@ export class HttpTransport extends EventEmitter implements ITransport {
     this.wss = new WebSocketServer({
       server: this.server,
       path: '/ws',
+      // SECURITY: browsers let any page open a WebSocket to localhost and CORS
+      // does not apply to upgrades, so refuse foreign Origins and rebound Hosts.
+      verifyClient: (info, callback) => {
+        const reason = rejectUpgradeReason(info.req, {
+          bindHost: this.config.host,
+          allowedOrigins: this.config.corsOrigins,
+          allowedHosts: this.config.allowedHosts,
+          authEnabled: !!this.config.auth?.enabled,
+        });
+        if (reason) {
+          this.logger.warn('WebSocket upgrade rejected', { reason });
+          callback(false, 403, 'Forbidden');
+          return;
+        }
+        callback(true);
+      },
     });
 
     this.setupWebSocketHandlers();
@@ -201,12 +220,10 @@ export class HttpTransport extends EventEmitter implements ITransport {
             return;
           }
 
-          if (allowedOrigins && allowedOrigins.length > 0) {
-            if (allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
-              callback(null, true);
-            } else {
-              callback(new Error(`CORS: Origin '${origin}' not allowed`));
-            }
+          if (isAllowedOrigin(origin, allowedOrigins, !!this.config.auth?.enabled)) {
+            callback(null, true);
+          } else if (allowedOrigins && allowedOrigins.length > 0) {
+            callback(new Error(`CORS: Origin '${origin}' not allowed`));
           } else {
             callback(new Error('CORS: Cross-origin requests not allowed'));
           }
@@ -245,6 +262,21 @@ export class HttpTransport extends EventEmitter implements ITransport {
         this.rejectUnauthorized(req, res);
       });
     }
+
+    // SECURITY: DNS-rebinding guard. A page on a rebound hostname is
+    // same-origin to itself, so CORS cannot stop it; the Host header can.
+    this.app.use((req: Request, res: Response, next: NextFunction) => {
+      if (isAllowedHostHeader(req.headers.host, this.config.host, this.config.allowedHosts)) {
+        next();
+        return;
+      }
+      this.logger.warn('Request rejected: Host header not allowed', { path: req.path });
+      res.status(403).json({
+        jsonrpc: '2.0',
+        id: null,
+        error: { code: -32001, message: 'Forbidden' },
+      });
+    });
 
     this.app.use(express.json({
       limit: this.config.maxRequestSize || '10mb',

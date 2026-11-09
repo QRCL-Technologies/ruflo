@@ -19,6 +19,7 @@ import type {
   ILogger,
   AuthConfig,
 } from '../types.js';
+import { rejectUpgradeReason } from './origin-guard.js';
 
 export interface WebSocketTransportConfig {
   host: string;
@@ -29,6 +30,10 @@ export interface WebSocketTransportConfig {
   heartbeatTimeout?: number;
   maxMessageSize?: number;
   auth?: AuthConfig;
+  /** Browser Origins allowed to connect; requests without an Origin are always allowed. */
+  allowedOrigins?: string[];
+  /** Extra Host header names accepted on a loopback bind (DNS-rebinding guard). */
+  allowedHosts?: string[];
   enableBinaryMode?: boolean;
 }
 
@@ -87,6 +92,22 @@ export class WebSocketTransport extends EventEmitter implements ITransport {
       path: this.config.path || '/ws',
       maxPayload: this.config.maxMessageSize || 10 * 1024 * 1024,
       perMessageDeflate: true,
+      // SECURITY: browsers let any page open a WebSocket to localhost and CORS
+      // does not apply to upgrades, so refuse foreign Origins and rebound Hosts.
+      verifyClient: (info, callback) => {
+        const reason = rejectUpgradeReason(info.req, {
+          bindHost: this.config.host,
+          allowedOrigins: this.config.allowedOrigins,
+          allowedHosts: this.config.allowedHosts,
+          authEnabled: !!this.config.auth?.enabled,
+        });
+        if (reason) {
+          this.logger.warn('WebSocket upgrade rejected', { reason });
+          callback(false, 403, 'Forbidden');
+          return;
+        }
+        callback(true);
+      },
     });
 
     this.setupWebSocketHandlers();
