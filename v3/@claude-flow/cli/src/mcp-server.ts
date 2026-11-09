@@ -59,7 +59,7 @@ export interface MCPServerOptions {
   requestTimeoutMs?: number;
   /**
    * Bearer token every HTTP request must present (`Authorization: Bearer <token>`).
-   * http transport only. Prefer RUFLO_MCP_HTTP_TOKEN / a token file over this
+   * http and websocket transports. Prefer RUFLO_MCP_HTTP_TOKEN / a token file over this
    * field's CLI flag so the secret stays out of argv. Never logged or emitted.
    */
   authToken?: string;
@@ -1010,10 +1010,8 @@ export class MCPServerManager extends EventEmitter {
     // Authorization gate first, before any import or bind: a refused start must
     // not depend on (or touch) anything else.
     const authToken = this.options.authToken || undefined;
-    if (authToken && this.options.transport !== 'http') {
-      // The standalone websocket transport has no working token check, so a
-      // token there would be a false promise of protection.
-      throw new Error('An MCP HTTP auth token is only supported with --transport http');
+    if (authToken && this.options.transport !== 'http' && this.options.transport !== 'websocket') {
+      throw new Error('An MCP auth token is only supported with --transport http or websocket');
     }
     if (shouldRefuseUnauthenticatedHttp(this.options.host, process.env, !!authToken)) {
       // No ToolAuthorizer is wired below: @claude-flow/mcp's tool-call

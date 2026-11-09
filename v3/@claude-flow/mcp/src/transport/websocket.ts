@@ -6,7 +6,8 @@
 
 import { EventEmitter } from 'events';
 import { WebSocketServer, WebSocket, RawData } from 'ws';
-import { createServer, Server } from 'http';
+import { createServer, Server, IncomingMessage } from 'http';
+import { createHash, timingSafeEqual } from 'crypto';
 import type {
   ITransport,
   TransportType,
@@ -30,6 +31,12 @@ export interface WebSocketTransportConfig {
   maxMessageSize?: number;
   auth?: AuthConfig;
   enableBinaryMode?: boolean;
+  /**
+   * Browser origins allowed to open a connection. Requests carrying any other
+   * Origin header are rejected during the handshake; an empty list (the
+   * default) rejects every browser origin. Non-browser clients send no Origin.
+   */
+  allowedOrigins?: string[];
 }
 
 interface ClientConnection {
@@ -87,6 +94,7 @@ export class WebSocketTransport extends EventEmitter implements ITransport {
       path: this.config.path || '/ws',
       maxPayload: this.config.maxMessageSize || 10 * 1024 * 1024,
       perMessageDeflate: true,
+      verifyClient: (info, callback) => this.verifyClient(info.req, callback),
     });
 
     this.setupWebSocketHandlers();
@@ -233,7 +241,8 @@ export class WebSocketTransport extends EventEmitter implements ITransport {
         lastActivity: new Date(),
         messageCount: 0,
         isAlive: true,
-        isAuthenticated: !this.config.auth?.enabled,
+        // verifyClient already rejected the handshake unless it was authorized.
+        isAuthenticated: true,
       };
 
       this.clients.set(clientId, client);
@@ -273,6 +282,67 @@ export class WebSocketTransport extends EventEmitter implements ITransport {
     });
   }
 
+  /**
+   * SECURITY: handshake gate. Rejects cross-site WebSocket hijacking (any
+   * browser Origin not explicitly allowed) and, when auth is enabled, any
+   * upgrade without a valid `Authorization: Bearer <token>` header.
+   */
+  private verifyClient(
+    req: IncomingMessage,
+    callback: (result: boolean, code?: number, message?: string) => void
+  ): void {
+    const origin = req.headers.origin;
+    if (origin !== undefined && !this.isOriginAllowed(origin)) {
+      this.logger.warn('WebSocket connection rejected: origin not allowed', { origin });
+      callback(false, 403, 'Forbidden');
+      return;
+    }
+
+    if (this.config.auth?.enabled && !this.isAuthorized(req)) {
+      // Never log the Authorization header or any token material.
+      this.logger.warn('WebSocket connection rejected: authentication failed');
+      callback(false, 401, 'Unauthorized');
+      return;
+    }
+
+    callback(true);
+  }
+
+  private isOriginAllowed(origin: string): boolean {
+    const allowed = this.config.allowedOrigins ?? [];
+    const normalized = origin.trim().toLowerCase();
+    return allowed.some((o) => o === '*' || o.trim().toLowerCase() === normalized);
+  }
+
+  private isAuthorized(req: IncomingMessage): boolean {
+    const auth = req.headers.authorization;
+    if (typeof auth !== 'string') {
+      return false;
+    }
+    const tokenMatch = auth.match(/^Bearer\s+(.+)$/i);
+    if (!tokenMatch) {
+      return false;
+    }
+
+    // Fail closed: auth enabled with no configured token accepts nothing.
+    const tokens = this.config.auth?.tokens ?? [];
+    let valid = false;
+    for (const validToken of tokens) {
+      // No early exit, so timing does not depend on which token matched.
+      if (this.timingSafeCompare(tokenMatch[1], validToken)) {
+        valid = true;
+      }
+    }
+    return valid;
+  }
+
+  /** Constant-time comparison over equal-length digests. */
+  private timingSafeCompare(a: string, b: string): boolean {
+    const digestA = createHash('sha256').update(a, 'utf8').digest();
+    const digestB = createHash('sha256').update(b, 'utf8').digest();
+    return timingSafeEqual(digestA, digestB);
+  }
+
   private async handleMessage(client: ClientConnection, data: RawData): Promise<void> {
     client.lastActivity = new Date();
     client.messageCount++;
@@ -281,15 +351,13 @@ export class WebSocketTransport extends EventEmitter implements ITransport {
     try {
       const message = this.parseMessage(data);
 
-      if (!client.isAuthenticated && this.config.auth?.enabled) {
-        if (message.method !== 'authenticate') {
-          client.ws.send(this.serializeMessage({
-            jsonrpc: '2.0',
-            id: message.id || null,
-            error: { code: -32001, message: 'Authentication required' },
-          } as MCPResponse));
-          return;
-        }
+      if (!client.isAuthenticated) {
+        client.ws.send(this.serializeMessage({
+          jsonrpc: '2.0',
+          id: message.id || null,
+          error: { code: -32001, message: 'Authentication required' },
+        } as MCPResponse));
+        return;
       }
 
       if (message.jsonrpc !== '2.0') {
